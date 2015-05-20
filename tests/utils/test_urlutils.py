@@ -21,209 +21,301 @@
 
 """Tests for qutebrowser.utils.urlutils."""
 
+import collections
+
 from PyQt5.QtCore import QUrl
 import pytest
 
-from qutebrowser.utils import urlutils
+from qutebrowser.commands import cmdexc
+from qutebrowser.utils import utils, urlutils
 
 
-def init_config_stub(stub, auto_search=True):
+class FakeDNS:
+
+    """Helper class for the fake_dns fixture."""
+
+    FakeDNSAnswer = collections.namedtuple('FakeDNSAnswer', ['error'])
+
+    def __init__(self):
+        self.reset()
+
+    def __repr__(self):
+        return utils.get_repr(self, used=self.used, answer=self.answer)
+
+    def reset(self):
+        self.used = False
+        self.answer = None
+
+    def _get_error(self):
+        return not self.answer
+
+    def fromname_mock(self, _host):
+        if self.answer is None:
+            raise ValueError("Got called without answer being set. This means "
+                             "something tried to make an unexpected DNS "
+                             "request (QHostInfo::fromName).")
+        if self.used:
+            raise ValueError("Got used twice!.")
+        self.used = True
+        return self.FakeDNSAnswer(error=self._get_error)
+
+
+@pytest.fixture(autouse=True)
+def fake_dns(monkeypatch):
+    """Patched QHostInfo.fromName to catch DNS requests.
+
+    With autouse=True so accidental DNS requests get discovered because the
+    fromname_mock will be called without answer being set.
+    """
+    dns = FakeDNS()
+    monkeypatch.setattr('qutebrowser.utils.urlutils.QHostInfo.fromName',
+                        dns.fromname_mock)
+    return dns
+
+
+@pytest.fixture(autouse=True)
+def urlutils_config_stub(config_stub, monkeypatch):
     """Initialize the given config_stub.
 
     Args:
         stub: The ConfigStub provided by the config_stub fixture.
         auto_search: The value auto-search should have.
     """
-    stub.data = {
-        'general': {'auto-search': auto_search},
+    config_stub.data = {
+        'general': {'auto-search': True},
         'searchengines': {
             'test': 'http://www.qutebrowser.org/?q={}',
             'DEFAULT': 'http://www.example.com/?q={}',
         },
     }
+    monkeypatch.setattr('qutebrowser.utils.urlutils.config', config_stub)
+    return config_stub
 
 
-class TestSpecialURL:
-
-    """Test is_special_url.
-
-    Attributes:
-        SPECIAL_URLS: URLs which are special.
-        NORMAL_URLS: URLs which are not special.
-    """
-
-    SPECIAL_URLS = (
-        'file:///tmp/foo',
-        'about:blank',
-        'qute:version'
-    )
-
-    NORMAL_URLS = (
-        'http://www.qutebrowser.org/',
-        'www.qutebrowser.org'
-    )
-
-    @pytest.mark.parametrize('url', SPECIAL_URLS)
-    def test_special_urls(self, url):
-        """Test special URLs."""
-        u = QUrl(url)
-        assert urlutils.is_special_url(u)
-
-    @pytest.mark.parametrize('url', NORMAL_URLS)
-    def test_normal_urls(self, url):
-        """Test non-special URLs."""
-        u = QUrl(url)
-        assert not urlutils.is_special_url(u)
+@pytest.fixture
+def urlutils_message_mock(message_mock):
+    message_mock.patch('qutebrowser.utils.urlutils.message')
+    return message_mock
 
 
-class TestSearchUrl:
-
-    """Test _get_search_url."""
-
-    @pytest.fixture(autouse=True)
-    def mock_config(self, config_stub, monkeypatch):
-        """Fixture to patch urlutils.config with a stub."""
-        init_config_stub(config_stub)
-        monkeypatch.setattr('qutebrowser.utils.urlutils.config', config_stub)
-
-    def test_default_engine(self):
-        """Test default search engine."""
-        url = urlutils._get_search_url('testfoo')
-        assert url.host() == 'www.example.com'
-        assert url.query() == 'q=testfoo'
-
-    def test_engine_pre(self):
-        """Test search engine name with one word."""
-        url = urlutils._get_search_url('test testfoo')
-        assert url.host() == 'www.qutebrowser.org'
-        assert url.query() == 'q=testfoo'
-
-    def test_engine_pre_multiple_words(self):
-        """Test search engine name with multiple words."""
-        url = urlutils._get_search_url('test testfoo bar foo')
-        assert url.host() == 'www.qutebrowser.org'
-        assert url.query() == 'q=testfoo bar foo'
-
-    def test_engine_pre_whitespace_at_end(self):
-        """Test search engine name with one word and whitespace."""
-        url = urlutils._get_search_url('test testfoo ')
-        assert url.host() == 'www.qutebrowser.org'
-        assert url.query() == 'q=testfoo'
-
-    def test_engine_with_bang_pre(self):
-        """Test search engine with a prepended !bang."""
-        url = urlutils._get_search_url('!python testfoo')
-        assert url.host() == 'www.example.com'
-        assert url.query() == 'q=%21python testfoo'
-
-    def test_engine_wrong(self):
-        """Test with wrong search engine."""
-        url = urlutils._get_search_url('blub testfoo')
-        assert url.host() == 'www.example.com'
-        assert url.query() == 'q=blub testfoo'
+@pytest.mark.parametrize('url, special', [
+    ('file:///tmp/foo', True),
+    ('about:blank', True),
+    ('qute:version', True),
+    ('http://www.qutebrowser.org/', False),
+    ('www.qutebrowser.org', False),
+])
+def test_special_urls(url, special):
+    u = QUrl(url)
+    assert urlutils.is_special_url(u) == special
 
 
-class TestIsUrl:
-
-    """Tests for is_url.
-
-    Class attributes:
-        URLS: A list of strings which are URLs.
-        NOT_URLS: A list of strings which aren't URLs.
-    """
-
-    URLS = (
-        'http://foobar',
-        'localhost:8080',
-        'qutebrowser.org',
-        ' qutebrowser.org ',
-        '127.0.0.1',
-        '::1',
-        '2001:41d0:2:6c11::1',
-        '94.23.233.17',
-        'http://user:password@qutebrowser.org/foo?bar=baz#fish',
-    )
-
-    NOT_URLS = (
-        'foo bar',
-        'localhost test',
-        'another . test',
-        'foo',
-        'this is: not an URL',
-        '23.42',
-        '1337',
-        'deadbeef',
-        '31c3',
-        'http:foo:0',
-        'foo::bar',
-    )
-
-    @pytest.mark.parametrize('url', URLS)
-    def test_urls(self, monkeypatch, config_stub, url):
-        """Test things which are URLs."""
-        init_config_stub(config_stub, 'naive')
-        monkeypatch.setattr('qutebrowser.utils.urlutils.config', config_stub)
-        assert urlutils.is_url(url), url
-
-    @pytest.mark.parametrize('url', NOT_URLS)
-    def test_not_urls(self, monkeypatch, config_stub, url):
-        """Test things which are not URLs."""
-        init_config_stub(config_stub, 'naive')
-        monkeypatch.setattr('qutebrowser.utils.urlutils.config', config_stub)
-        assert not urlutils.is_url(url), url
-
-    @pytest.mark.parametrize('autosearch', [True, False])
-    def test_search_autosearch(self, monkeypatch, config_stub, autosearch):
-        """Test explicit search with auto-search=True."""
-        init_config_stub(config_stub, autosearch)
-        monkeypatch.setattr('qutebrowser.utils.urlutils.config', config_stub)
-        assert not urlutils.is_url('test foo')
+@pytest.mark.parametrize('url, host, query', [
+    ('testfoo', 'www.example.com', 'q=testfoo'),
+    ('test testfoo', 'www.qutebrowser.org', 'q=testfoo'),
+    ('test testfoo bar foo', 'www.qutebrowser.org', 'q=testfoo bar foo'),
+    ('test testfoo ', 'www.qutebrowser.org', 'q=testfoo'),
+    ('!python testfoo', 'www.example.com', 'q=%21python testfoo'),
+    ('blub testfoo', 'www.example.com', 'q=blub testfoo'),
+])
+def test_get_search_url(urlutils_config_stub, url, host, query):
+    """Tests for _get_search_url."""
+    url = urlutils._get_search_url(url)
+    assert url.host() == host
+    assert url.query() == query
 
 
-class TestQurlFromUserInput:
+@pytest.mark.parametrize('is_url, is_url_no_autosearch, uses_dns, url', [
+    # Normal hosts
+    (True, True, False, 'http://foobar'),
+    (True, True, False, 'localhost:8080'),
+    (True, True, True, 'qutebrowser.org'),
+    (True, True, True, ' qutebrowser.org '),
+    (True, True, False, 'http://user:password@example.com/foo?bar=baz#fish'),
+    # IPs
+    (True, True, False, '127.0.0.1'),
+    (True, True, False, '::1'),
+    (True, True, True, '2001:41d0:2:6c11::1'),
+    (True, True, True, '94.23.233.17'),
+    # Special URLs
+    (True, True, False, 'file:///tmp/foo'),
+    (True, True, False, 'about:blank'),
+    (True, True, False, 'qute:version'),
+    (True, True, False, 'localhost'),
+    # _has_explicit_scheme False, special_url True
+    (True, True, False, 'qute::foo'),
+    # Invalid URLs
+    (False, True, False, ''),
+    (False, True, False, 'http:foo:0'),
+    # Not URLs
+    (False, True, False, 'foo bar'),  # no DNS because of space
+    (False, True, False, 'localhost test'),  # no DNS because of space
+    (False, True, False, 'another . test'),  # no DNS because of space
+    (False, True, True, 'foo'),
+    (False, True, False, 'this is: not an URL'),  # no DNS because of space
+    (False, True, False, '23.42'),  # no DNS because bogus-IP
+    (False, True, False, '1337'),  # no DNS because bogus-IP
+    (False, True, True, 'deadbeef'),
+    (False, True, False, '31c3'),  # no DNS because bogus-IP
+    (False, True, False, 'foo::bar'),  # no DNS because of no host
+    # Valid search term with autosearch
+    (False, False, False, 'test foo'),
+    # autosearch = False
+    (False, True, False, 'This is an URL without autosearch'),
+])
+def test_is_url(urlutils_config_stub, fake_dns, is_url, is_url_no_autosearch,
+                uses_dns, url):
+    urlutils_config_stub.data['general']['auto-search'] = 'dns'
+    if uses_dns:
+        fake_dns.answer = True
+        result = urlutils.is_url(url)
+        assert fake_dns.used
+        assert result
+        fake_dns.reset()
 
-    """Tests for qurl_from_user_input."""
+        fake_dns.answer = False
+        result = urlutils.is_url(url)
+        assert fake_dns.used
+        assert not result
+    else:
+        result = urlutils.is_url(url)
+        assert not fake_dns.used
+        assert result == is_url
 
-    def test_url(self):
-        """Test a normal URL."""
-        url = urlutils.qurl_from_user_input('qutebrowser.org')
-        assert url.toString() == 'http://qutebrowser.org'
+    fake_dns.reset()
+    urlutils_config_stub.data['general']['auto-search'] = 'naive'
+    assert urlutils.is_url(url) == is_url
+    assert not fake_dns.used
 
-    def test_url_http(self):
-        """Test a normal URL with http://."""
-        url = urlutils.qurl_from_user_input('http://qutebrowser.org')
-        assert url.toString() == 'http://qutebrowser.org'
-
-    def test_ipv6_bare(self):
-        """Test an IPv6 without brackets."""
-        url = urlutils.qurl_from_user_input('::1/foo')
-        assert url.toString() == 'http://[::1]/foo'
-
-    def test_ipv6(self):
-        """Test an IPv6 with brackets."""
-        url = urlutils.qurl_from_user_input('[::1]/foo')
-        assert url.toString() == 'http://[::1]/foo'
-
-    def test_ipv6_http(self):
-        """Test an IPv6 with http:// and brackets."""
-        url = urlutils.qurl_from_user_input('http://[::1]')
-        assert url.toString() == 'http://[::1]'
+    fake_dns.reset()
+    urlutils_config_stub.data['general']['auto-search'] = False
+    assert urlutils.is_url(url) == is_url_no_autosearch
+    assert not fake_dns.used
 
 
-class TestFilenameFromUrl:
+@pytest.mark.parametrize('user_input, output', [
+    ('qutebrowser.org', 'http://qutebrowser.org'),
+    ('http://qutebrowser.org', 'http://qutebrowser.org'),
+    ('::1/foo', 'http://[::1]/foo'),
+    ('[::1]/foo', 'http://[::1]/foo'),
+    ('http://[::1]', 'http://[::1]'),
+    ('qutebrowser.org', 'http://qutebrowser.org'),
+    ('http://qutebrowser.org', 'http://qutebrowser.org'),
+    ('::1/foo', 'http://[::1]/foo'),
+    ('[::1]/foo', 'http://[::1]/foo'),
+    ('http://[::1]', 'http://[::1]'),
+])
+def test_qurl_from_user_input(user_input, output):
+    url = urlutils.qurl_from_user_input(user_input)
+    assert url.toString() == output
 
-    """Tests for filename_from_url."""
 
-    def test_invalid_url(self):
-        """Test with an invalid QUrl."""
-        assert urlutils.filename_from_url(QUrl()) is None
+@pytest.mark.parametrize('url, valid, has_err_string', [
+    ('http://www.example.com/', True, False),
+    ('', False, False),
+    ('://', False, True),
+])
+def test_invalid_url_error(urlutils_message_mock, url, valid, has_err_string):
+    """Tests for invalid_url_error."""
+    qurl = QUrl(url)
+    assert qurl.isValid() == valid
+    if valid:
+        with pytest.raises(ValueError):
+            urlutils.invalid_url_error(0, qurl, '')
+        assert not urlutils_message_mock.messages
+    else:
+        assert bool(qurl.errorString()) == has_err_string
+        urlutils.invalid_url_error(0, qurl, 'frozzle')
 
-    def test_url_path(self):
-        """Test with an URL with path."""
-        url = QUrl('http://qutebrowser.org/test.html')
-        assert urlutils.filename_from_url(url) == 'test.html'
+        msg = urlutils_message_mock.getmsg()
+        assert msg.win_id == 0
+        assert msg.immediate == False
+        if has_err_string:
+            expected_text = ("Trying to frozzle with invalid URL - " +
+                             qurl.errorString())
+        else:
+            expected_text = "Trying to frozzle with invalid URL"
+        assert msg.text == expected_text
 
-    def test_url_host(self):
-        """Test with an URL with no path."""
-        url = QUrl('http://qutebrowser.org/')
-        assert urlutils.filename_from_url(url) == 'qutebrowser.org.html'
+
+@pytest.mark.parametrize('url, valid, has_err_string', [
+    ('http://www.example.com/', True, False),
+    ('', False, False),
+    ('://', False, True),
+])
+def test_raise_cmdexc_if_invalid(url, valid, has_err_string):
+    """Tests for raise_cmdexc_if_invalid."""
+    qurl = QUrl(url)
+    assert qurl.isValid() == valid
+    if valid:
+        urlutils.raise_cmdexc_if_invalid(qurl)
+    else:
+        assert bool(qurl.errorString()) == has_err_string
+        with pytest.raises(cmdexc.CommandError) as excinfo:
+            urlutils.raise_cmdexc_if_invalid(qurl)
+        if has_err_string:
+            expected_text = "Invalid URL - " + qurl.errorString()
+        else:
+            expected_text = "Invalid URL"
+        assert str(excinfo.value) == expected_text
+
+
+@pytest.mark.parametrize('qurl, output', [
+    (QUrl(), None),
+    (QUrl('http://qutebrowser.org/test.html'), 'test.html'),
+    (QUrl('http://qutebrowser.org/foo.html#bar'), 'foo.html'),
+    (QUrl('http://user:password@qutebrowser.org/foo?bar=baz#fish'), 'foo'),
+    (QUrl('http://qutebrowser.org/'), 'qutebrowser.org.html'),
+    (QUrl('qute://'), None),
+])
+def test_filename_from_url(qurl, output):
+    assert urlutils.filename_from_url(qurl) == output
+
+
+@pytest.mark.parametrize('qurl, tpl', [
+    (QUrl(), None),
+    (QUrl('qute://'), None),
+    (QUrl('qute://foobar'), None),
+    (QUrl('mailto:nobody'), None),
+    (QUrl('ftp://example.com/'),
+        ('ftp', 'example.com', 21)),
+    (QUrl('ftp://example.com:2121/'),
+        ('ftp', 'example.com', 2121)),
+    (QUrl('http://qutebrowser.org:8010/waterfall'),
+        ('http', 'qutebrowser.org', 8010)),
+    (QUrl('https://example.com/'),
+        ('https', 'example.com', 443)),
+    (QUrl('https://example.com:4343/'),
+        ('https', 'example.com', 4343)),
+    (QUrl('http://user:password@qutebrowser.org/foo?bar=baz#fish'),
+        ('http', 'qutebrowser.org', 80)),
+])
+def test_host_tuple(qurl, tpl):
+    if tpl is None:
+        with pytest.raises(ValueError):
+            urlutils.host_tuple(qurl)
+    else:
+        assert urlutils.host_tuple(qurl) == tpl
+
+
+@pytest.mark.parametrize('url, raising, has_err_string', [
+    (None, False, False),
+    (QUrl(), False, False),
+    (QUrl('http://www.example.com/'), True, False),
+])
+def test_fuzzy_url_error(url, raising, has_err_string):
+    """Tests for FuzzyUrlError."""
+    if raising:
+        expected_exc = ValueError
+    else:
+        expected_exc = urlutils.FuzzyUrlError
+
+    with pytest.raises(expected_exc) as excinfo:
+        raise urlutils.FuzzyUrlError("Error message", url)
+
+    if not raising:
+        if has_err_string:
+            expected_text = "Error message: " + qurl.errorString()
+        else:
+            expected_text = "Error message"
+        assert str(excinfo.value) == expected_text
